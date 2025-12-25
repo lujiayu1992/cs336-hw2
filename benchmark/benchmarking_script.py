@@ -5,6 +5,7 @@ import timeit
 import torch
 import numpy as np
 import torch.nn.functional as F
+import contextlib
 
 # Import the model and config from the cs336_basics package
 from cs336_basics.cs336_basics.model import BasicsTransformerLM
@@ -96,25 +97,31 @@ def run_benchmark(args):
         dtype=torch.long,
     )
     print(f"Data shape (Batch, SeqLen): {labels.shape}")
-    # --- 3. Run w warm-up steps ---
-    for _ in range(args.num_warmup):
-        if args.mode == "forward":
-            run_forward_step(model, labels)
-        elif args.mode == "forward_backward":
-            run_forward_backward_step(model, labels, args.vocab_size)
-        torch.cuda.synchronize()
 
-    timings = []
-    print(f"Running {args.num_steps} measurement steps...")
-    for _ in range(args.num_steps):
-        start_time = timeit.default_timer()
-        if args.mode == "forward":
-            run_forward_step(model, labels)
-        elif args.mode == "forward_backward":
-            run_forward_backward_step(model, labels, args.vocab_size)
-        torch.cuda.synchronize()
-        end_time = timeit.default_timer()
-        timings.append(end_time - start_time)
+    ctx = contextlib.nullcontext()
+    if args.use_bf16:
+        ctx = torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16)
+
+    with ctx:
+        # --- 3. Run w warm-up steps ---
+        for _ in range(args.num_warmup):
+            if args.mode == "forward":
+                run_forward_step(model, labels)
+            elif args.mode == "forward_backward":
+                run_forward_backward_step(model, labels, args.vocab_size)
+            torch.cuda.synchronize()
+
+        timings = []
+        print(f"Running {args.num_steps} measurement steps...")
+        for _ in range(args.num_steps):
+            start_time = timeit.default_timer()
+            if args.mode == "forward":
+                run_forward_step(model, labels)
+            elif args.mode == "forward_backward":
+                run_forward_backward_step(model, labels, args.vocab_size)
+            torch.cuda.synchronize()
+            end_time = timeit.default_timer()
+            timings.append(end_time - start_time)
 
     avg_time = np.mean(timings)
     std_dev = np.std(timings)
@@ -185,6 +192,12 @@ if __name__ == "__main__":
         type=int,
         default=10000,
         help="Vocabulary size (default: 10000, as per section 1.1.2) [cite: 61]",
+    )
+
+    parser.add_argument(
+        "--use_bf16", 
+        action="store_true", 
+        help="Enable autocasting to bfloat16. If not set, defaults to no casting."
     )
 
     args = parser.parse_args()
