@@ -1,6 +1,5 @@
 #!/usr/bin/env python
-
-# PYTHONPATH=. python benchmark/benchmarking_script.py --mode forward --model_size xl --num_steps 1 --record_memory
+# PYTHONPATH=. python benchmark/benchmarking_script.py --mode forward_backward --model_size xl --num_steps 1 --record_memory
 import argparse
 import contextlib
 import os
@@ -67,8 +66,7 @@ class BenchmarkRunner:
     def run_step(self, inputs: torch.Tensor):
         """Executes a single step based on the configured mode."""
         if self.args.mode == "forward":
-            with torch.no_grad():
-                _ = self.model(inputs)
+            _ = self.model(inputs)
         
         elif self.args.mode == "forward_backward":
             self.model.zero_grad()
@@ -93,12 +91,8 @@ class BenchmarkRunner:
 
     def _save_memory_snapshot(self):
         """Saves the memory snapshot to disk."""
-        if not os.path.exists(self.args.snapshot_dir):
-            os.makedirs(self.args.snapshot_dir)
-
         filename = f"memory_snapshot_{self.args.model_size}_{self.args.mode}_{self.args.context_length}.pickle"
         snapshot_path = os.path.join(self.args.snapshot_dir, filename)
-
         try:
             torch.cuda.memory._dump_snapshot(snapshot_path)
             print(f"Memory snapshot saved to: {snapshot_path}")
@@ -182,7 +176,7 @@ def main():
     # System Arguments
     parser.add_argument("--use_bf16", action="store_true", help="Enable bfloat16 autocast.")
     parser.add_argument("--record_memory", action="store_true", help="Enable CUDA memory recording.")
-    parser.add_argument("--snapshot_dir", type=str, default="snapshots", 
+    parser.add_argument("--snapshot_dir", type=str, default="/xcloud-shared/jiayulu", 
                         help="Directory to save memory snapshots.")
 
     args = parser.parse_args()
