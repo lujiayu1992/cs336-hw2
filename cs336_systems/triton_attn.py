@@ -1,6 +1,6 @@
-import torch
 import triton
 import triton.language as tl
+from einops import rearrange, einsum
 
 @triton.jit
 def get_block_ptr(
@@ -107,22 +107,8 @@ def flash_fwd_kernel(
 
     for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
         K = tl.load(K_block_ptr, boundary_check=(0, 1))
-        V = tl.load(V_block_ptr, boundary_check=(0, 1))
-        S = tl.dot(Q, tl.trans(K)) * scale
-        S_row_max = tl.max(S, axis=-1)
-        m_new = tl.maximum(m_i, S_row_max)
-        P = tl.exp(S-m_new[:, None])
-        alpha = m_i - m_new
-        l_new = tl.exp(alpha) *  l_i + tl.sum(P, axis= -1)
-        O_i = tl.exp(alpha)[:, None] * O_i + tl.dot(P, V)
-        m_i = m_new
-        l_i = l_new
-
-        K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
-        V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
-
-    tl.store(O_block_ptr, (1/l_i)[:, None] * O_i, boundary_check=(0, 1))
-    tl.store(L_block_ptr, m_i + tl.log(l_i), boundary_check=(0,))
+        S = einsum(Q, K, "... q d, ... k d -> ... q k") * scale
+        
 
 
 @triton.jit()
