@@ -1,151 +1,80 @@
 import torch
-import triton
-import triton.language as tl
+import math
+from einops import rearrange, einsum
 
-@triton.jit
-def get_block_ptr(
-    ptr, 
-    stride_b, stride_s, stride_d,
-    N_seq, D_dim,
-    batch_idx, 
-    tile_idx, 
-    BLOCK_SIZE, 
-    order=(1, 0)
-):
-    return tl.make_block_ptr(
-        ptr + batch_idx * stride_b,
-        shape=(N_seq, D_dim),
-        strides=(stride_s, stride_d),
-        offsets=(tile_idx * BLOCK_SIZE, 0),
-        block_shape=(BLOCK_SIZE, D_dim),
-        order=order
-    )
-
-class TritonAttention(torch.autograd.Function):
+class TorchAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Q, K, V, is_causal = False):
-        pass
-    
+    def forward(ctx, Q, K, V, is_causal=False):
+        # Q: ... q d
+        # K: ... k d
+        # V: ... k d
+        
+        # Calculate scale factor
+        d = Q.shape[-1]
+        scale = 1.0 / math.sqrt(d)
+
+        # 1. Compute Scores (S)
+        # Pattern: queries (q) and keys (k) interact over dimension (d)
+        S = einsum(Q, K, "... q d, ... k d -> ... q k") * scale
+
+        # 3. Compute LogSumExp (L) for numerical stability and backward pass
+        # Reduce over keys (k)
+        L = torch.logsumexp(S, dim=-1)
+
+        # 4. Compute Probabilities (P)
+        # Expand L to match S: ... q -> ... q 1
+        P = torch.exp(S - rearrange(L, "... q -> ... q 1"))
+
+        # 5. Compute Output (O)
+        # Pattern: probabilities (q, k) weight the values (k, d) -> result (q, d)
+        O = einsum(P, V, "... q k, ... k d -> ... q d")
+
+        # SAVE FOR BACKWARD:
+        ctx.save_for_backward(Q, K, V, O, L)
+        ctx.scale = scale # Save scale as a python float or scalar
+
+        return O
+
     @staticmethod
     def backward(ctx, dO):
-        pass
+        # Retrieve saved tensors
+        Q, K, V, O, L = ctx.saved_tensors
+        scale = ctx.scale
 
-@triton.jit()
-def flash_fwd_kernel(
-    Q_ptr, K_ptr, V_ptr,
-    O_ptr, L_ptr,
-    stride_qb, stride_qq, stride_qd,
-    stride_kb, stride_kk, stride_kd,
-    stride_vb, stride_vk, stride_vd,
-    stride_ob, stride_oq, stride_od,
-    stride_lb, stride_lq,
-    N_QUERIES, N_KEYS,
-    scale,
-    D: tl.constexpr,
-    Q_TILE_SIZE: tl.constexpr, 
-    K_TILE_SIZE: tl.constexpr,
-    is_causal: tl.constexpr = False,
-):
+        # 1. Compute D (correction term for Softmax derivative)
+        # D is the dot product of dO and O, summed over dimension d
+        # Shape: ... q
+        D = einsum(dO, O, "... q d, ... q d -> ... q")
 
-    query_tile_index = tl.program_id(0)
-    batch_index = tl.program_id(1)
+        # 2. Recompute P (Probabilities) on-the-fly
+        # We need S first: S = QK^T
+        S = einsum(Q, K, "... q d, ... k d -> ... q k") * scale
+        
+        # P = exp(S - L)
+        # Note: L must be broadcasted: ... q -> ... q 1
+        P = torch.exp(S - rearrange(L, "... q -> ... q 1"))
 
-    # make input block pointers
-    Q_block_ptr = tl.make_block_ptr(
-        Q_ptr + batch_index * stride_qb,
-        shape = (N_QUERIES, D),
-        strides = (stride_qq, stride_qd),
-        offsets = (query_tile_index * Q_TILE_SIZE, 0),
-        block_shape = (Q_TILE_SIZE, D),
-        order = (1, 0), # major to minor
-    )
+        # 3. Compute dP (Gradient wrt Probabilities)
+        # dP = dO @ V^T
+        # Pattern: ... q d, ... k d -> ... q k
+        dP = einsum(dO, V, "... q d, ... k d -> ... q k")
 
-    K_block_ptr = tl.make_block_ptr(
-        K_ptr + batch_index * stride_kb,
-        shape = (N_KEYS, D),
-        strides = (stride_kk, stride_kd),
-        offsets = (0 * K_TILE_SIZE, 0),
-        block_shape = (K_TILE_SIZE, D),
-        order = (1, 0), # major to minor
-    )
+        # 4. Compute dS (Gradient wrt Scores)
+        # dS = P * (dP - D)
+        # D must be broadcasted: ... q -> ... q 1
+        dS = P * (dP - rearrange(D, "... q -> ... q 1")) * scale
 
-    V_block_ptr = tl.make_block_ptr(
-        V_ptr + batch_index * stride_vb,
-        shape = (N_KEYS, D),
-        strides = (stride_vk, stride_vd),
-        offsets = (0 * K_TILE_SIZE, 0),
-        block_shape = (K_TILE_SIZE, D),
-        order = (1, 0), # major to minor
-    )
+        # 5. Compute Gradients for Q, K, V
+        # dQ = dS @ K
+        # Pattern: ... q k, ... k d -> ... q d
+        dQ = einsum(dS, K, "... q k, ... k d -> ... q d")
 
-    O_block_ptr = tl.make_block_ptr(
-        O_ptr + batch_index * stride_ob,
-        shape = (N_QUERIES, D),
-        strides = (stride_oq, stride_od),
-        offsets = (query_tile_index * Q_TILE_SIZE, 0),
-        block_shape = (Q_TILE_SIZE, D),
-        order = (1, 0), # major to minor
-    )
+        # dK = dS^T @ Q
+        # Pattern: ... q k, ... q d -> ... k d
+        dK = einsum(dS, Q, "... q k, ... q d -> ... k d")
 
-    L_block_ptr = tl.make_block_ptr(
-        L_ptr + batch_index * stride_lb,
-        shape = (N_QUERIES, ),
-        strides = (stride_lq,),
-        offsets = (query_tile_index* Q_TILE_SIZE,),
-        block_shape = (Q_TILE_SIZE,),
-        order = (0,), # major to minor
-    )
+        # dV = P^T @ dO
+        # Pattern: ... q k, ... q d -> ... k d
+        dV = einsum(P, dO, "... q k, ... q d -> ... k d")
 
-    Q = tl.load(Q_block_ptr, boundary_check=(0, 1))
-
-    # m_i is initialized to negative infinity so the first max update works correctly
-    m_i = tl.full((Q_TILE_SIZE,), -float('inf'), dtype=tl.float32)
-    
-    # l_i and O_i start at zero
-    l_i = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
-    O_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
-
-    for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
-        K = tl.load(K_block_ptr, boundary_check=(0, 1))
-        V = tl.load(V_block_ptr, boundary_check=(0, 1))
-        S = tl.dot(Q, tl.trans(K)) * scale
-        S_row_max = tl.max(S, axis=-1)
-        m_new = tl.maximum(m_i, S_row_max)
-        P = tl.exp(S-m_new[:, None])
-        alpha = m_i - m_new
-        l_new = tl.exp(alpha) *  l_i + tl.sum(P, axis= -1)
-        O_i = tl.exp(alpha)[:, None] * O_i + tl.dot(P, V)
-        m_i = m_new
-        l_i = l_new
-
-        K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
-        V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
-
-    tl.store(O_block_ptr, (1/l_i)[:, None] * O_i, boundary_check=(0, 1))
-    tl.store(L_block_ptr, m_i + tl.log(l_i), boundary_check=(0,))
-
-
-@triton.jit()
-def flash_bwd_kernel(
-    Q_ptr, O_ptr, dO_ptr,
-    K_ptr, V_ptr, L_ptr, D_ptr,
-    dQ_ptr, dK_ptr, dV_ptr,
-    stride_qb, stride_qq, stride_qd,
-    stride_ob, stride_oq, stride_od,
-    stride_dob, stride_doq, stride_dod,
-    stride_kb, stride_kk, stride_kd,
-    stride_vb, stride_vk, stride_vd,
-    stride_lb, stride_lq,
-    stride_db, stride_dq,
-    stride_dqb, stride_dqq, stride_dqd,
-    stride_dkb, stride_dkk, stride_dkd,
-    stride_dvb, stride_dvk, stride_dvd,
-    N_QUERIES, N_KEYS,
-    scale,
-    D: tl.constexpr,
-    Q_TILE_SIZE: tl.constexpr, 
-    K_TILE_SIZE: tl.constexpr,
-    is_causal: tl.constexpr = False,
-):
-    key_tile_index = tl.program_id(0) # first dim from pytorch launch
-    batch_index = tl.program_id(1) # second dim from kernel launch
+        return dQ, dK, dV, None
