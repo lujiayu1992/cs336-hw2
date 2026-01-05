@@ -1,30 +1,52 @@
+import torch
 import triton
 import triton.language as tl
-from einops import rearrange, einsum
-
-@triton.jit
-def get_block_ptr(
-    ptr, 
-    stride_b, stride_s, stride_d,
-    N_seq, D_dim,
-    batch_idx, 
-    tile_idx, 
-    BLOCK_SIZE, 
-    order=(1, 0)
-):
-    return tl.make_block_ptr(
-        ptr + batch_idx * stride_b,
-        shape=(N_seq, D_dim),
-        strides=(stride_s, stride_d),
-        offsets=(tile_idx * BLOCK_SIZE, 0),
-        block_shape=(BLOCK_SIZE, D_dim),
-        order=order
-    )
 
 class TritonAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, Q, K, V, is_causal = False):
-        pass
+    def forward(ctx, Q, K, V, is_causal=False):
+        # 1. Unpack shapes directly (Avoids redundant b, q, k, d vars)
+        BATCH, N_Q, D = Q.shape
+        _, N_K, _ = K.shape
+
+        # 2. Allocate Output & Buffer
+        O = torch.empty_like(Q, device=Q.device)
+        L = torch.empty((BATCH, N_Q), device=Q.device, dtype=torch.float32)
+
+        # 3. Constants
+        scale = D ** -0.5
+        Q_TILE_SIZE = 128
+        K_TILE_SIZE = 64
+        
+        # 4. Kernel Launch
+        grid = (triton.cdiv(N_Q, Q_TILE_SIZE), BATCH)
+        
+        flash_fwd_kernel[grid](
+            Q, K, V,
+            O, L,
+            *Q.stride(), # Unpacks to (stride_qb, stride_qq, stride_qd)
+            *K.stride(),
+            *V.stride(),
+            *O.stride(),
+            *L.stride(), # Unpacks to (stride_lb, stride_lq)
+            N_Q, N_K,
+            scale,
+            D=D,
+            Q_TILE_SIZE=Q_TILE_SIZE,
+            K_TILE_SIZE=K_TILE_SIZE,
+            is_causal=is_causal,
+        )
+
+        # 5. Save for Backward & Return
+        ctx.save_for_backward(Q, K, V, O, L)
+        ctx.scale = scale
+        ctx.grid = grid
+        ctx.is_causal = is_causal
+        ctx.Q_TILE_SIZE = Q_TILE_SIZE
+        ctx.K_TILE_SIZE = K_TILE_SIZE
+        
+        return O
+
     
     @staticmethod
     def backward(ctx, dO):
@@ -107,8 +129,33 @@ def flash_fwd_kernel(
 
     for j in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
         K = tl.load(K_block_ptr, boundary_check=(0, 1))
-        S = einsum(Q, K, "... q d, ... k d -> ... q k") * scale
-        
+        V = tl.load(V_block_ptr, boundary_check=(0, 1))
+        S = tl.dot(Q, tl.trans(K)) * scale
+
+        offs_n = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+        offs_m = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+
+        mask = offs_n[None, :] < N_KEYS
+
+        if is_causal:
+            mask = mask & (offs_m[:, None] >= offs_n[None, :])
+
+        S = tl.where(mask, S, float("-inf"))
+
+        S_row_max = tl.max(S, axis=-1)
+        m_new = tl.maximum(m_i, S_row_max)
+        P = tl.exp(S-m_new[:, None])
+        alpha = m_i - m_new
+        l_new = tl.exp(alpha) *  l_i + tl.sum(P, axis= -1)
+        O_i = tl.exp(alpha)[:, None] * O_i + tl.dot(P.to(V.dtype), V)
+        m_i = m_new
+        l_i = l_new
+
+        K_block_ptr = tl.advance(K_block_ptr, (K_TILE_SIZE, 0))
+        V_block_ptr = tl.advance(V_block_ptr, (K_TILE_SIZE, 0))
+
+    tl.store(O_block_ptr, (1/l_i)[:, None] * O_i, boundary_check=(0, 1))
+    tl.store(L_block_ptr, m_i + tl.log(l_i), boundary_check=(0,))
 
 
 @triton.jit()
