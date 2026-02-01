@@ -1,5 +1,7 @@
+import argparse
 import os
 import time
+from cs336_systems import ddp_overlap_bucketed
 from cs336_systems import overlap_ddp
 from einops import rearrange
 # --- LOCAL IMPORTS ---
@@ -28,16 +30,26 @@ XL_CONFIG = {
 }
 
 
-def run_naive_ddp(
+def run_ddp_benchmark(
     rank,
     world_size,
     backend,
     global_input_ids,
     global_target_ids,
-    flat=False,
-    overlap=False,
+    ddp_policy="naive",
+    bucket_size_mb=25,
 ):
-  """Executes Naïve DDP Benchmarking with the XL Model."""
+  """Executes DDP Benchmarking.
+
+  Args:
+      ddp_policy (str): One of "naive", "flat", "overlap".
+  """
+  # 0. Validate Input
+  valid_modes = {"naive", "flat", "overlap", "bucket"}
+  if ddp_policy not in valid_modes:
+    raise ValueError(
+        f"Invalid ddp_policy: '{ddp_policy}'. Must be one of {valid_modes}"
+    )
 
   # 1. SETUP
   device = _setup_process_group(rank, world_size, backend)
@@ -54,9 +66,11 @@ def run_naive_ddp(
       rope_theta=10000.0,
   ).to(device)
 
-  if overlap:
+  if ddp_policy == "overlap":
     # This handles the weight broadcast internally in __init__
     model = overlap_ddp.OverlapDDP(model)
+  elif ddp_policy == "bucket":
+    model = ddp_overlap_bucketed.OverlapDDP(model, bucket_size_mb)
 
   # Optimizer
   ddp_optimizer = optim.SGD(model.parameters(), lr=0.01)
@@ -107,10 +121,9 @@ def run_naive_ddp(
     # --- B. COMMUNICATION START ---
     sync()
     t2 = time.perf_counter()
-    if overlap:
+    if ddp_policy == "overlap" or ddp_policy == "bucket":
       model.finish_gradient_synchronization()
-
-    elif flat:
+    elif ddp_policy == "flat":
       params_with_grad = [p for p in model.parameters() if p.grad is not None]
       grads = [p.grad for p in params_with_grad]
       flat_buffer = torch._utils._flatten_dense_tensors(grads)
@@ -118,7 +131,7 @@ def run_naive_ddp(
       restored_grads = torch._utils._unflatten_dense_tensors(flat_buffer, grads)
       for p, synced_grad in zip(params_with_grad, restored_grads):
         p.grad.data.copy_(synced_grad)
-    else:
+    elif ddp_policy == "naive":
       for param in model.parameters():
         if param.grad is None:
           continue
@@ -166,6 +179,17 @@ def run_naive_ddp(
 
 
 if __name__ == "__main__":
+  parser = argparse.ArgumentParser()
+  # Add a single string argument instead of two booleans
+  parser.add_argument(
+      "--policy",
+      type=str,
+      choices=["naive", "flat", "overlap", "bucket"],
+      default="overlap",
+      help="Which DDP implementation to run.",
+  )
+  args = parser.parse_args()
+
   world_size = 2
   batch_size = 2  # As per assignment spec for XL model
 
@@ -186,17 +210,27 @@ if __name__ == "__main__":
       dtype=torch.long,
   )
 
-  print("Spawning processes...")
-  mp.spawn(
-      run_naive_ddp,
-      args=(
-          world_size,  # world_size
-          "nccl",  # backend
-          global_input_ids,  # global_input_ids
-          global_target_ids,  # global_target_ids
-          False,  # flat
-          True,  # overlap
-      ),
-      nprocs=world_size,
-      join=True,
-  )
+  bucket_sizes_to_test = [5, 10, 25, 50, 100]
+
+  for size in bucket_sizes_to_test:
+    if args.policy in ["overlap", "bucket"]:
+      print(
+          f"\n\n>>> BENCHMARKING POLICY: {args.policy.upper()} | BUCKET SIZE:"
+          f" {size} MB <<<"
+      )
+    else:
+      print(f"\n\n>>> BENCHMARKING POLICY: {args.policy.upper()} <<<")
+
+    mp.spawn(
+        run_ddp_benchmark,
+        args=(
+            world_size,
+            "nccl",
+            global_input_ids,
+            global_target_ids,
+            args.policy,
+            size,  # Pass the current size from the loop
+        ),
+        nprocs=world_size,
+        join=True,
+    )
