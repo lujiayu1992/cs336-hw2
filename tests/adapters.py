@@ -4,6 +4,7 @@ from typing import Type
 import cs336_systems.torch_attn as torch_attn
 import cs336_systems.triton_attn as triton_attn
 import cs336_systems.overlap_ddp as overlap_ddp
+import cs336_systems.ddp_overlap_bucketed as ddp_overlap_bucketed
 import torch
 
 
@@ -91,7 +92,7 @@ def get_ddp_bucketed(module: torch.nn.Module, bucket_size_mb: float) -> torch.nn
     Returns:
         Instance of a DDP class.
     """
-    raise NotImplementedError
+    return ddp_overlap_bucketed.OverlapDDP(module, bucket_size_mb)
 
 
 def ddp_bucketed_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -106,7 +107,7 @@ def ddp_bucketed_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.
             Optimizer being used with the DDP-wrapped model.
     """
     # For example: ddp_model.finish_gradient_synchronization()
-    raise NotImplementedError
+    return ddp_model.finish_gradient_synchronization()
 
 
 def ddp_bucketed_on_train_batch_start(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -119,7 +120,14 @@ def ddp_bucketed_on_train_batch_start(ddp_model: torch.nn.Module, optimizer: tor
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
     """
-    raise NotImplementedError
+    # 1. Standard PyTorch: Clear old gradients
+    optimizer.zero_grad()
+    
+    # 2. Safety Check (Optional but good for tests):
+    # Ensure buckets are reset in case the previous test crashed halfway.
+    # If your ddp_model is the wrapper, you can access the internal list.
+    for bucket in ddp_model.buckets:
+            bucket.reset()
 
 
 def get_sharded_optimizer(params, optimizer_cls: Type[torch.optim.Optimizer], **kwargs) -> torch.optim.Optimizer:
