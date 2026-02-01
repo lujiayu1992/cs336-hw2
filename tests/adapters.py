@@ -5,6 +5,9 @@ import cs336_systems.torch_attn as torch_attn
 import cs336_systems.triton_attn as triton_attn
 import cs336_systems.overlap_ddp as overlap_ddp
 import cs336_systems.ddp_overlap_bucketed as ddp_overlap_bucketed
+import cs336_systems.sharded_optimizer as sharded_optimizer
+
+
 import torch
 
 
@@ -146,4 +149,4 @@ def get_sharded_optimizer(params, optimizer_cls: Type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    return sharded_optimizer.ShardedOptimizer(params, optimizer_cls, **kwargs)
