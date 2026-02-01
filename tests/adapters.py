@@ -1,54 +1,141 @@
+from __future__ import annotations
+
+from typing import Type
+import cs336_systems.torch_attn as torch_attn
+import cs336_systems.triton_attn as triton_attn
+import cs336_systems.overlap_ddp as overlap_ddp
 import torch
-import torch.nn as nn
-import torch.distributed as dist
 
-class OverlapDDP(nn.Module):
-    def __init__(self, model: torch.nn.Module):
-        super().__init__()
-        self.model = model
-        self.module = model
-        self.handles = []
-        
-        for p in model.parameters():
-            dist.broadcast(p.data, src=0)
-            if p.requires_grad:
-                # Use a closure or partial to capture the specific parameter 'p'
-                p.register_post_accumulate_grad_hook(self._make_hook(p))
-                
-    def _make_hook(self, p):
-        def hook(param):
-            if param.grad is None:
-                return
-            
-            # 1. Manually divide by world size to simulate averaging
-            #    We do this in-place before sending.
-            #    This makes it compatible with Gloo (CPU) which lacks ReduceOp.AVG
-            world_size = dist.get_world_size()
-            param.grad.data /= world_size
-            
-            # 2. Fire async communication using SUM
-            handle = dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, async_op=True)
-            
-            self.handles.append(handle)
-        return hook
 
-    def wait_for_all(self):
-        for h in self.handles:
-            h.wait()
-        self.handles = []
 
-    def forward(self, *inputs, **kwargs):
-        """
-        Standard forward pass. 
-        Since this is a wrapper, we just pass inputs to the underlying model.
-        """
-        return self.model(*inputs, **kwargs)
-    
-    def finish_gradient_synchronization(self):
-        """
-        Waits for all asynchronous communication to finish.
-        MUST be called after loss.backward() and before optimizer.step().
-        """
-        for handle in self.handles:
-            handle.wait()
-        self.handles.clear()
+def get_flashattention_autograd_function_pytorch() -> Type:
+    """
+    Returns a torch.autograd.Function subclass that implements FlashAttention2.
+    The expectation is that this class will implement FlashAttention2
+    using only standard PyTorch operations (no Triton!).
+
+    Returns:
+        A class object (not an instance of the class)
+    """
+    # For example: return MyFlashAttnAutogradFunctionClass
+    return torch_attn.TorchAttention
+
+
+def get_flashattention_autograd_function_triton() -> Type:
+    """
+    Returns a torch.autograd.Function subclass that implements FlashAttention2
+    using Triton kernels.
+    The expectation is that this class will implement the same operations
+    as the class you return in get_flashattention_autograd_function_pytorch(),
+    but it should do so by invoking custom Triton kernels in the forward
+    and backward passes.
+
+    Returns:
+        A class object (not an instance of the class)
+    """
+    # For example: return MyTritonFlashAttentionAutogradFunctionClass
+    return triton_attn.TritonAttention
+
+
+def get_ddp_individual_parameters(module: torch.nn.Module) -> torch.nn.Module:
+    """
+    Returns a torch.nn.Module container that handles
+    parameter broadcasting and gradient synchronization for
+    distributed data parallel training.
+
+    This container should overlaps communication with backprop computation
+    by asynchronously communicating gradients as they are ready
+    in the backward pass. The gradient for each parameter tensor
+    is individually communicated.
+
+    Args:
+        module: torch.nn.Module
+            Underlying model to wrap with DDP.
+    Returns:
+        Instance of a DDP class.
+    """
+    # For example: return DDPIndividualParameters(module)
+    return overlap_ddp.OverlapDDP(module)
+
+
+def ddp_individual_parameters_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
+    """
+    Code to run after the backward pass is completed, but before we take
+    an optimizer step.
+
+    Args:
+        ddp_model: torch.nn.Module
+            DDP-wrapped model.
+        optimizer: torch.optim.Optimizer
+            Optimizer being used with the DDP-wrapped model.
+    """
+    # For example: ddp_model.finish_gradient_synchronization()
+    return  ddp_model.finish_gradient_synchronization()
+
+
+def get_ddp_bucketed(module: torch.nn.Module, bucket_size_mb: float) -> torch.nn.Module:
+    """
+    Returns a torch.nn.Module container that handles
+    parameter broadcasting and gradient synchronization for
+    distributed data parallel training.
+
+    This container should overlaps communication with backprop computation
+    by asynchronously communicating buckets of gradients as they are ready
+    in the backward pass.
+
+    Args:
+        module: torch.nn.Module
+            Underlying model to wrap with DDP.
+        bucket_size_mb: The bucket size, in megabytes. If None, use a single
+            bucket of unbounded size.
+    Returns:
+        Instance of a DDP class.
+    """
+    raise NotImplementedError
+
+
+def ddp_bucketed_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
+    """
+    Code to run after the backward pass is completed, but before we take
+    an optimizer step.
+
+    Args:
+        ddp_model: torch.nn.Module
+            DDP-wrapped model.
+        optimizer: torch.optim.Optimizer
+            Optimizer being used with the DDP-wrapped model.
+    """
+    # For example: ddp_model.finish_gradient_synchronization()
+    raise NotImplementedError
+
+
+def ddp_bucketed_on_train_batch_start(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
+    """
+    Code to run at the very start of the training step.
+
+    Args:
+        ddp_model: torch.nn.Module
+            DDP-wrapped model.
+        optimizer: torch.optim.Optimizer
+            Optimizer being used with the DDP-wrapped model.
+    """
+    raise NotImplementedError
+
+
+def get_sharded_optimizer(params, optimizer_cls: Type[torch.optim.Optimizer], **kwargs) -> torch.optim.Optimizer:
+    """
+    Returns a torch.optim.Optimizer that handles optimizer state sharding
+    of the given optimizer_cls on the provided parameters.
+
+    Arguments:
+        params (``Iterable``): an ``Iterable`` of :class:`torch.Tensor` s
+            or :class:`dict` s giving all parameters, which will be sharded
+            across ranks.
+        optimizer_class (:class:`torch.nn.Optimizer`): the class of the local
+            optimizer.
+    Keyword arguments:
+        kwargs: keyword arguments to be forwarded to the optimizer constructor.
+    Returns:
+        Instance of sharded optimizer.
+    """
+    raise NotImplementedError
